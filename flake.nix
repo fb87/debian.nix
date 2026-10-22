@@ -1,38 +1,65 @@
 # vim: tabstop=2 shiftwidth=2 expandtab autoindent colorcolumn=80
 {
-  description = "Ubuntu Noble arm64 sysroot builder";
+  description = "Ubuntu Noble sysroot and cross-toolchain builder";
 
   inputs = {
+    flake-utils.url = "github:numtide/flake-utils";
     nixpkgs.url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst";
   };
 
-  outputs = inputs: {
-    packages.aarch64-linux = let
-      pkgs = inputs.nixpkgs.legacyPackages.aarch64-linux;
-      arm64Ubuntu = "http://ports.ubuntu.com/ubuntu-ports";
+  outputs = inputs:
+    inputs.flake-utils.lib.eachSystem [ "aarch64-linux" "x86_64-linux" ] (system: {
+      packages = let
+        pkgs = inputs.nixpkgs.legacyPackages.${system};
+        architectures = {
+          "aarch64-linux" = {
+            debian = "arm64";
+            ubuntu = "http://ports.ubuntu.com/ubuntu-ports";
+            triple = "aarch64-linux-gnu";
+            processor = "aarch64";
+            loader = "ld-linux-aarch64.so.1";
+          };
+          "x86_64-linux" = {
+            debian = "amd64";
+            ubuntu = "http://archive.ubuntu.com/ubuntu";
+            triple = "x86_64-linux-gnu";
+            processor = "x86_64";
+            loader = "ld-linux-x86-64.so.2";
+          };
+        };
+        native = architectures.${system};
 
-      ubuntuKeyring = pkgs.fetchurl {
-        url = "${arm64Ubuntu}/project/ubuntu-archive-keyring.gpg";
-        hash = "sha256-gKNrCm3i9p9J0t9170c8zeEh6eGQueoB0gpPY3eNXDE=";
-      };
+        fetchUbuntuKeyring = ubuntu: pkgs.fetchurl {
+          url = "${ubuntu}/project/ubuntu-archive-keyring.gpg";
+          hash = "sha256-gKNrCm3i9p9J0t9170c8zeEh6eGQueoB0gpPY3eNXDE=";
+        };
 
-      nobleSource = pkgs.writeText "noble-arm64.sources" ''
-        Types: deb deb-src
-        URIs: ${arm64Ubuntu}
-        Suites: noble noble-updates noble-backports noble-security
-        Components: main restricted universe multiverse
-        Signed-By: ${ubuntuKeyring}
-      '';
+        arm64Keyring = fetchUbuntuKeyring architectures.aarch64-linux.ubuntu;
+        amd64Keyring = fetchUbuntuKeyring architectures.x86_64-linux.ubuntu;
 
-      toolsPath = pkgs.lib.makeBinPath [
-        pkgs.apt
-        pkgs.coreutils
-        pkgs.dpkg
-        pkgs.gnupg
-        pkgs.gzip
-      ];
+        makeSource = name: ubuntu: keyring: pkgs.writeText name ''
+          Types: deb deb-src
+          URIs: ${ubuntu}
+          Suites: noble noble-updates noble-backports noble-security
+          Components: main restricted universe multiverse
+          Signed-By: ${keyring}
+        '';
 
-      mkRepo = pkgs.writeShellScriptBin "mk-repo" ''
+        arm64Source = makeSource "noble-arm64.sources"
+          architectures.aarch64-linux.ubuntu arm64Keyring;
+        amd64Source = makeSource "noble-amd64.sources"
+          architectures.x86_64-linux.ubuntu amd64Keyring;
+        nativeSource = if native.debian == "arm64" then arm64Source else amd64Source;
+
+        toolsPath = pkgs.lib.makeBinPath [
+          pkgs.apt
+          pkgs.coreutils
+          pkgs.dpkg
+          pkgs.gnupg
+          pkgs.gzip
+        ];
+
+        mkRepo = name: architecture: source: pkgs.writeShellScriptBin name ''
         set -euo pipefail
         export PATH=${toolsPath}:$PATH
 
@@ -48,10 +75,10 @@
         ${pkgs.coreutils}/bin/touch "$work/status"
 
         apt_args=(
-          -o APT::Architecture=arm64
+          -o APT::Architecture=${architecture}
           -o Dir::Bin::dpkg=${pkgs.dpkg}/bin/dpkg
           -o Dir::Bin::gpgv=${pkgs.gnupg}/bin/gpgv
-          -o Dir::Etc::sourcelist=${nobleSource}
+          -o Dir::Etc::sourcelist=${source}
           -o Dir::Etc::sourceparts=-
           -o Dir::State::status="$work/status"
           -o Dir::State::lists="$work/lists"
@@ -74,9 +101,9 @@
           ${pkgs.dpkg}/bin/dpkg-scanpackages . /dev/null |
             ${pkgs.gzip}/bin/gzip -9 > Packages.gz
         )
-      '';
+        '';
 
-      mkRoot = name: pkgs.writeShellScriptBin name ''
+        mkRoot = name: repo: repoName: pkgs.writeShellScriptBin name ''
         set -euo pipefail
         export PATH=${toolsPath}:$PATH
 
@@ -88,19 +115,248 @@
         root=$1
         repo=$2
         shift 2
-        ${mkRepo}/bin/mk-repo "$repo" "$@"
+        ${repo}/bin/${repoName} "$repo" "$@"
 
         ${pkgs.coreutils}/bin/mkdir -p "$root"
         for deb in "$repo/"*.deb; do
           ${pkgs.dpkg}/bin/dpkg-deb --extract "$deb" "$root"
         done
-      '';
+        '';
 
-      mkDevRoot = mkRoot "mk-devroot";
-      mkRelRoot = mkRoot "mk-relroot";
-    in {
-      inherit mkDevRoot mkRelRoot mkRepo nobleSource ubuntuKeyring;
-      default = mkDevRoot;
-    };
-  };
+        nativeRepo = mkRepo "mk-repo" native.debian nativeSource;
+        arm64Repo = mkRepo "mk-arm64-repo" "arm64" arm64Source;
+        amd64Repo = mkRepo "mk-amd64-repo" "amd64" amd64Source;
+        mkDevRoot = mkRoot "mk-devroot" nativeRepo "mk-repo";
+        mkArm64DevRoot = mkRoot "mk-arm64-devroot" arm64Repo "mk-arm64-repo";
+        mkAmd64DevRoot = mkRoot "mk-amd64-devroot" amd64Repo "mk-amd64-repo";
+        mkCrossToolchain = pkgs.writeShellScriptBin "mk-cross-toolchain" ''
+          set -euo pipefail
+
+          if [ "$#" -lt 3 ]; then
+            printf 'usage: %s TOOLCHAIN_DIR TARGET_SYSTEM PACKAGE...\n' "$0" >&2
+            exit 2
+          fi
+
+          toolchain_dir=$1
+          if [ ! -d "$toolchain_dir" ]; then
+            ${pkgs.coreutils}/bin/mkdir -p "$toolchain_dir"
+          fi
+          toolchain_dir=$(${pkgs.coreutils}/bin/realpath "$toolchain_dir")
+          shift
+          target_system=$1
+          shift
+
+          host_repo="$toolchain_dir/host-repo"
+          host_root="$toolchain_dir/host-root"
+
+          system=${system}
+          case "$system" in
+            x86_64-linux)
+              host_triple=x86_64-linux-gnu
+              host_loader=ld-linux-x86-64.so.2
+              ;;
+            aarch64-linux)
+              host_triple=aarch64-linux-gnu
+              host_loader=ld-linux-aarch64.so.1
+              ;;
+            *)
+              printf 'unsupported host system: %s\n' "$system" >&2
+              exit 1
+              ;;
+          esac
+
+          case "$target_system" in
+            aarch64-linux)
+              target_debian=arm64
+              target_triple=aarch64-linux-gnu
+              target_processor=aarch64
+              target_loader=ld-linux-aarch64.so.1
+              target_repo="$toolchain_dir/arm64-repo"
+              target_root="$toolchain_dir/arm64-root"
+              target_builder=${mkArm64DevRoot}/bin/mk-arm64-devroot
+              ;;
+            x86_64-linux)
+              target_debian=amd64
+              target_triple=x86_64-linux-gnu
+              target_processor=x86_64
+              target_loader=ld-linux-x86-64.so.2
+              target_repo="$toolchain_dir/amd64-repo"
+              target_root="$toolchain_dir/amd64-root"
+              target_builder=${mkAmd64DevRoot}/bin/mk-amd64-devroot
+              ;;
+            *)
+              printf 'unsupported target system: %s\n' "$target_system" >&2
+              exit 1
+              ;;
+          esac
+          toolchain_file="$toolchain_dir/$target_triple.cmake"
+          wrapper_dir="$toolchain_dir/bin"
+
+          if [ "$system" = "$target_system" ]; then
+            host_packages=(build-essential)
+            compiler_name=gcc
+            cxx_compiler_name=g++
+            host_tool_prefix=
+            cross_compile_prefix=
+          else
+            host_packages=(crossbuild-essential-"$target_debian")
+            compiler_name="$target_triple-gcc"
+            cxx_compiler_name="$target_triple-g++"
+            host_tool_prefix="$target_triple-"
+            cross_compile_prefix="$wrapper_dir/$target_triple-"
+          fi
+
+          ${mkDevRoot}/bin/mk-devroot "$host_root" "$host_repo" \
+            "''${host_packages[@]}"
+
+          ${pkgs.coreutils}/bin/mkdir -p "$wrapper_dir"
+          host_loader_path="$host_root/usr/lib/$host_triple/$host_loader"
+          host_library_path="$host_root/usr/lib/$host_triple:$host_root/usr/lib"
+
+          ${pkgs.coreutils}/bin/cat > "$wrapper_dir/tool-wrapper" <<EOF
+          #!/bin/sh
+          set -eu
+          case "\$1" in
+            "$wrapper_dir/"*)
+              exec "\$@"
+              ;;
+          esac
+          exec "$host_loader_path" --library-path "$host_library_path" "\$@"
+          EOF
+
+          ${pkgs.coreutils}/bin/cat > "$wrapper_dir/gcc" <<EOF
+          #!/bin/sh
+          set -eu
+          exec "$host_loader_path" --library-path "$host_library_path" \\
+            "$host_root/usr/bin/$compiler_name" \\
+            -wrapper "$wrapper_dir/tool-wrapper" "\$@"
+          EOF
+
+          ${pkgs.coreutils}/bin/cat > "$wrapper_dir/g++" <<EOF
+          #!/bin/sh
+          set -eu
+          exec "$host_loader_path" --library-path "$host_library_path" \\
+            "$host_root/usr/bin/$cxx_compiler_name" \\
+            -wrapper "$wrapper_dir/tool-wrapper" "\$@"
+          EOF
+
+          ${pkgs.coreutils}/bin/cat > "$wrapper_dir/binutils-wrapper" <<EOF
+          #!/bin/sh
+          set -eu
+          name=\$(basename "\$0")
+          case "\$name" in
+            "$target_triple-as") name=as ;;
+            "$target_triple-ld") name=ld ;;
+            "$target_triple-ar") name=ar ;;
+            "$target_triple-ranlib") name=ranlib ;;
+            "$target_triple-strip") name=strip ;;
+            "$target_triple-objcopy") name=objcopy ;;
+            "$target_triple-nm") name=nm ;;
+            "$target_triple-objdump") name=objdump ;;
+            "$target_triple-readelf") name=readelf ;;
+          esac
+          [ "\$name" = ld ] && name=ld.bfd
+          exec "$host_loader_path" --library-path "$host_library_path" \\
+            "$host_root/usr/bin/$host_tool_prefix\$name" "\$@"
+          EOF
+
+          for tool in as ld ar ranlib strip objcopy nm objdump readelf; do
+            ${pkgs.coreutils}/bin/ln -sf binutils-wrapper "$wrapper_dir/$tool"
+            ${pkgs.coreutils}/bin/ln -sf binutils-wrapper \
+              "$wrapper_dir/$target_triple-$tool"
+          done
+
+          ${pkgs.coreutils}/bin/chmod 755 \
+            "$wrapper_dir/gcc" "$wrapper_dir/g++" \
+            "$wrapper_dir/tool-wrapper" "$wrapper_dir/binutils-wrapper"
+          c_compiler="$wrapper_dir/gcc"
+          cxx_compiler="$wrapper_dir/g++"
+          "$target_builder" "$target_root" "$target_repo" "$@"
+
+          target_arch=x86
+          [ "$target_debian" = arm64 ] && target_arch=arm64
+          ${pkgs.coreutils}/bin/cat > "$toolchain_dir/environment" <<EOF
+          export TOOLCHAIN_ROOT="$toolchain_dir"
+          export SYSROOT="$target_root"
+          export ARCH="$target_arch"
+          export CROSS_COMPILE="$cross_compile_prefix"
+          export CC="$c_compiler"
+          export CXX="$cxx_compiler"
+          export CPP="$c_compiler -E"
+          export AR="$wrapper_dir/ar"
+          export AS="$wrapper_dir/as"
+          export LD="$wrapper_dir/ld"
+          export NM="$wrapper_dir/nm"
+          export OBJCOPY="$wrapper_dir/objcopy"
+          export OBJDUMP="$wrapper_dir/objdump"
+          export RANLIB="$wrapper_dir/ranlib"
+          export READELF="$wrapper_dir/readelf"
+          export STRIP="$wrapper_dir/strip"
+          export PKG_CONFIG_SYSROOT_DIR="$target_root"
+          export PKG_CONFIG_LIBDIR="$target_root/usr/lib/$target_triple/pkgconfig:$target_root/usr/share/pkgconfig"
+          export PKG_CONFIG_PATH=
+          export PATH="$wrapper_dir:\$PATH"
+          export CFLAGS="-B$wrapper_dir -isysroot $target_root"
+          export CXXFLAGS="-B$wrapper_dir -isysroot $target_root"
+          export LDFLAGS="-B$wrapper_dir -L$target_root/usr/$target_triple/lib -L$target_root/usr/lib/$target_triple -Wl,-rpath-link,$target_root/usr/lib/$target_triple"
+          EOF
+
+          ${pkgs.coreutils}/bin/mkdir -p \
+            "$target_root/lib" "$target_root/usr/$target_triple"
+          if [ ! -e "$target_root/lib/$target_triple" ] &&
+             [ ! -L "$target_root/lib/$target_triple" ]; then
+            ${pkgs.coreutils}/bin/ln -s ../usr/lib/$target_triple \
+              "$target_root/lib/$target_triple"
+          fi
+          if [ ! -e "$target_root/usr/$target_triple/lib" ] &&
+             [ ! -L "$target_root/usr/$target_triple/lib" ]; then
+            ${pkgs.coreutils}/bin/ln -s ../../lib/$target_triple \
+              "$target_root/usr/$target_triple/lib"
+          fi
+          if [ ! -e "$target_root/lib/$target_loader" ] &&
+             [ ! -L "$target_root/lib/$target_loader" ]; then
+            ${pkgs.coreutils}/bin/ln -s \
+              ../usr/lib/$target_triple/$target_loader \
+              "$target_root/lib/$target_loader"
+          fi
+          if [ "$target_debian" = amd64 ]; then
+            ${pkgs.coreutils}/bin/mkdir -p "$target_root/lib64"
+            if [ ! -e "$target_root/lib64/$target_loader" ] &&
+               [ ! -L "$target_root/lib64/$target_loader" ]; then
+              ${pkgs.coreutils}/bin/ln -s \
+                ../usr/lib/$target_triple/$target_loader \
+                "$target_root/lib64/$target_loader"
+            fi
+          fi
+
+          ${pkgs.coreutils}/bin/cat > "$toolchain_file" <<EOF
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_SYSTEM_PROCESSOR $target_processor)
+          set(CMAKE_LIBRARY_ARCHITECTURE $target_triple)
+
+           set(CMAKE_C_COMPILER "$c_compiler")
+           set(CMAKE_CXX_COMPILER "$cxx_compiler")
+           set(CMAKE_C_FLAGS_INIT
+               "-B$wrapper_dir -L$target_root/usr/$target_triple/lib -L$target_root/usr/lib/$target_triple -Wl,-rpath-link,$target_root/usr/lib/$target_triple")
+           set(CMAKE_CXX_FLAGS_INIT
+               "-B$wrapper_dir -L$target_root/usr/$target_triple/lib -L$target_root/usr/lib/$target_triple -Wl,-rpath-link,$target_root/usr/lib/$target_triple")
+           set(CMAKE_EXE_LINKER_FLAGS_INIT
+               "-B$wrapper_dir -L$target_root/usr/$target_triple/lib -L$target_root/usr/lib/$target_triple -Wl,-rpath-link,$target_root/usr/lib/$target_triple")
+          set(CMAKE_SYSROOT "$target_root")
+          set(CMAKE_FIND_ROOT_PATH "$target_root")
+          set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+          set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+          set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+          set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
+          set(ENV{PKG_CONFIG_SYSROOT_DIR} "$target_root")
+          set(ENV{PKG_CONFIG_LIBDIR}
+              "$target_root/usr/lib/$target_triple/pkgconfig:$target_root/usr/share/pkgconfig")
+          set(ENV{PKG_CONFIG_PATH} "")
+          EOF
+        '';
+      in {
+        inherit mkCrossToolchain;
+      };
+    });
 }
