@@ -122,6 +122,55 @@
         done
         '';
 
+        mkRootFromRepo = name: architecture: pkgs.writeShellScriptBin name ''
+          set -euo pipefail
+          export PATH=${toolsPath}:$PATH
+
+          if [ "$#" -lt 4 ]; then
+            printf 'usage: %s ROOT REPOSITORY SUITE PACKAGE...\n' "$0" >&2
+            exit 2
+          fi
+
+          root=$1
+          repo=$2
+          shift 2
+          suite=$1
+          shift
+          work=$(${pkgs.coreutils}/bin/mktemp -d)
+          trap '${pkgs.coreutils}/bin/rm -rf "$work"' EXIT
+          ${pkgs.coreutils}/bin/mkdir -p "$root" "$work/lists/partial" "$work/cache/archives/partial"
+          ${pkgs.coreutils}/bin/touch "$work/status"
+          ${pkgs.coreutils}/bin/printf 'deb [trusted=yes] file:%s ./\n' "$repo" > "$work/sources.list"
+
+          apt_args=(
+            -o APT::Architecture=${architecture}
+            -o Dir::Bin::dpkg=${pkgs.dpkg}/bin/dpkg
+            -o Dir::Etc::sourcelist="$work/sources.list"
+            -o Dir::Etc::sourceparts=-
+            -o Dir::State::status="$work/status"
+            -o Dir::State::lists="$work/lists"
+            -o Dir::Cache::archives="$work/cache/archives"
+            -o Dir::Cache::srcpkgcache="$work/srcpkgcache"
+            -o Dir::Cache::pkgcache="$work/pkgcache"
+          )
+          ${pkgs.apt}/bin/apt-get "''${apt_args[@]}" update
+          uris=$(${pkgs.apt}/bin/apt-get "''${apt_args[@]}" -qq --yes --print-uris install "$@")
+          ${pkgs.coreutils}/bin/mkdir -p "$root"
+          while read -r quoted_uri filename _; do
+            [ -n "$filename" ] || continue
+            deb="$repo/$filename"
+            if [ ! -f "$deb" ]; then
+              printf 'package archive not found in repository: %s\n' "$filename" >&2
+              exit 1
+            fi
+            ${pkgs.dpkg}/bin/dpkg-deb --extract "$deb" "$root"
+          done <<< "$uris"
+          if [ ! -d "$root/usr" ]; then
+            printf 'local repository did not provide any package archives\n' >&2
+            exit 1
+          fi
+        '';
+
         nativeRepo = if native.debian == "arm64" then
           mkRepo "mk-repo" native.debian native.ubuntu arm64Keyring
         else
@@ -133,6 +182,8 @@
         mkDevRoot = mkRoot "mk-devroot" nativeRepo "mk-repo";
         mkArm64DevRoot = mkRoot "mk-arm64-devroot" arm64Repo "mk-arm64-repo";
         mkAmd64DevRoot = mkRoot "mk-amd64-devroot" amd64Repo "mk-amd64-repo";
+        mkArm64Rootfs = mkRootFromRepo "mk-arm64-rootfs" "arm64";
+        mkAmd64Rootfs = mkRootFromRepo "mk-amd64-rootfs" "amd64";
         mkSdk = pkgs.writeShellScriptBin "mk-sdk" ''
           set -euo pipefail
 
@@ -225,8 +276,9 @@
              exit 2
            fi
 
-          host_repo="$toolchain_dir/host-repo"
-          host_root="$toolchain_dir/host-root"
+           cache_root=''${DEBIAN_NIX_CACHE:-''${XDG_CACHE_HOME:-"$HOME/.cache"}/debian.nix}
+           ${pkgs.coreutils}/bin/mkdir -p "$cache_root"
+           host_root="$toolchain_dir/host-root"
 
           system=${system}
           case "$system" in
@@ -250,28 +302,30 @@
               target_triple=aarch64-linux-gnu
               target_processor=aarch64
               target_loader=ld-linux-aarch64.so.1
-               target_repo="$toolchain_dir/arm64-repo"
-               target_rootfs_repo="$toolchain_dir/arm64-rootfs-repo"
-               target_root="$toolchain_dir/sysroot"
-               target_rootfs="$toolchain_dir/rootfs"
-              target_builder=${mkArm64DevRoot}/bin/mk-arm64-devroot
+                target_root="$toolchain_dir/sysroot"
+                target_rootfs="$toolchain_dir/rootfs"
+                target_builder=${mkArm64DevRoot}/bin/mk-arm64-devroot
+                target_rootfs_builder=${mkArm64Rootfs}/bin/mk-arm64-rootfs
               ;;
             x86_64-linux)
               target_debian=amd64
               target_triple=x86_64-linux-gnu
               target_processor=x86_64
               target_loader=ld-linux-x86-64.so.2
-               target_repo="$toolchain_dir/amd64-repo"
-               target_rootfs_repo="$toolchain_dir/amd64-rootfs-repo"
-               target_root="$toolchain_dir/sysroot"
-               target_rootfs="$toolchain_dir/rootfs"
-              target_builder=${mkAmd64DevRoot}/bin/mk-amd64-devroot
+                target_root="$toolchain_dir/sysroot"
+                target_rootfs="$toolchain_dir/rootfs"
+                target_builder=${mkAmd64DevRoot}/bin/mk-amd64-devroot
+                target_rootfs_builder=${mkAmd64Rootfs}/bin/mk-amd64-rootfs
               ;;
             *)
              printf 'unsupported target system: %s\n' "$target_system" >&2
                exit 1
                ;;
            esac
+
+           host_repo="$cache_root/$system/$suite/host-repo"
+           target_repo="$cache_root/$target_system/$suite/target-repo"
+           ${pkgs.coreutils}/bin/mkdir -p "$host_repo" "$target_repo"
 
            toolchain_file="$toolchain_dir/$target_triple.cmake"
           wrapper_dir="$toolchain_dir/bin"
@@ -387,22 +441,26 @@
              "\$sdk_root/host-root/usr/bin/$host_tool_prefix\$name" "\$@"
           EOF
 
-          for tool in as ld ar ranlib strip objcopy nm objdump readelf; do
+           for tool in as ld ar ranlib strip objcopy nm objdump readelf; do
             ${pkgs.coreutils}/bin/ln -sf binutils-wrapper "$wrapper_dir/$tool"
             ${pkgs.coreutils}/bin/ln -sf binutils-wrapper \
               "$wrapper_dir/$target_triple-$tool"
           done
 
-          ${pkgs.coreutils}/bin/chmod 755 \
-            "$wrapper_dir/gcc" "$wrapper_dir/g++" \
-            "$wrapper_dir/tool-wrapper" "$wrapper_dir/binutils-wrapper"
+           ${pkgs.coreutils}/bin/chmod 755 \
+             "$wrapper_dir/gcc" "$wrapper_dir/g++" \
+             "$wrapper_dir/tool-wrapper" "$wrapper_dir/binutils-wrapper"
+           for generated in "$wrapper_dir"/gcc "$wrapper_dir"/g++ \
+             "$wrapper_dir"/tool-wrapper "$wrapper_dir"/binutils-wrapper; do
+             ${pkgs.gnused}/bin/sed -i 's/^ //' "$generated"
+           done
            c_compiler="$wrapper_dir/gcc"
            cxx_compiler="$wrapper_dir/g++"
            target_packages=("''${runtime_packages[@]}" "''${development_packages[@]}")
            "$target_builder" "$target_root" "$target_repo" "$suite" \
              "''${target_packages[@]}"
            ${pkgs.coreutils}/bin/rm -rf "$target_rootfs"
-           "$target_builder" "$target_rootfs" "$target_rootfs_repo" "$suite" \
+           "$target_rootfs_builder" "$target_rootfs" "$target_repo" "$suite" \
              "''${runtime_packages[@]}"
 
            prepare_root() {
@@ -464,13 +522,11 @@
              fi
            fi
            ${pkgs.coreutils}/bin/cat > "$toolchain_dir/environment" <<EOF
-            SDK_ROOT=\$(CDPATH= cd -- "\''${BASH_SOURCE[0]%/*}" && pwd)
+            SDK_ROOT=\$(CDPATH= cd -- "\$(dirname -- "\''${BASH_SOURCE[0]}")" && pwd)
            export TOOLCHAIN_ROOT="\$SDK_ROOT"
            export SYSROOT="\$SDK_ROOT/sysroot"
            export ARCH="$target_arch"
-           export CROSS_COMPILE=""
-           [ -n "$cross_compile_prefix" ] && \
-             export CROSS_COMPILE="\$SDK_ROOT/bin/$target_triple-"
+           export CROSS_COMPILE="''${cross_compile_prefix:+\$SDK_ROOT/bin/$target_triple-}"
            export CC="\$SDK_ROOT/bin/gcc"
            export CXX="\$SDK_ROOT/bin/g++"
            export CPP="\$SDK_ROOT/bin/gcc -E"
@@ -489,8 +545,9 @@
            export PATH="\$SDK_ROOT/bin:\$PATH"
            export CFLAGS="-B\$SDK_ROOT/bin --sysroot=\$SDK_ROOT/sysroot"
            export CXXFLAGS="-B\$SDK_ROOT/bin --sysroot=\$SDK_ROOT/sysroot"
-           export LDFLAGS="-B\$SDK_ROOT/bin -L\$SDK_ROOT/sysroot/usr/$target_triple/lib -L\$SDK_ROOT/sysroot/usr/lib/$target_triple -Wl,-rpath-link,\$SDK_ROOT/sysroot/usr/lib/$target_triple"
+            export LDFLAGS="-B\$SDK_ROOT/bin -L\$SDK_ROOT/sysroot/usr/$target_triple/lib -L\$SDK_ROOT/sysroot/usr/lib/$target_triple -Wl,-rpath-link,\$SDK_ROOT/sysroot/usr/lib/$target_triple"
           EOF
+           ${pkgs.gnused}/bin/sed -i 's/^ //' "$toolchain_dir/environment"
 
           ${pkgs.coreutils}/bin/mkdir -p \
             "$target_root/lib" "$target_root/usr/$target_triple"
@@ -546,8 +603,9 @@
            set(ENV{PKG_CONFIG_SYSROOT_DIR} "\''${TARGET_ROOT}")
            set(ENV{PKG_CONFIG_LIBDIR}
                 "\''${TARGET_ROOT}/usr/lib/$target_triple/pkgconfig:\''${TARGET_ROOT}/usr/share/pkgconfig")
-             set(ENV{PKG_CONFIG_PATH} "")
+              set(ENV{PKG_CONFIG_PATH} "")
           EOF
+           ${pkgs.gnused}/bin/sed -i 's/^ //' "$toolchain_file"
 
            sdk_archive="$toolchain_dir.tar.gz"
            ${pkgs.coreutils}/bin/rm -f "$sdk_archive"

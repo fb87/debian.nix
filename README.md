@@ -64,7 +64,6 @@ The command creates:
 - `<target-triplet>.cmake`: CMake toolchain file
 - `sysroot/`: target development sysroot
 - `rootfs.tar.gz`: runtime-only root filesystem ready for deployment
-- `<target>-repo`: persistent target package repository
 - `host-root`: host compiler and binutils environment
 
 The bundle is written next to the SDK directory. For example, building
@@ -86,9 +85,12 @@ cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=./sdk/aarch64-linux-gnu.cmake
 cmake --build build
 ```
 
-Package archives and APT metadata remain in the repository directories, so
-subsequent invocations reuse already downloaded packages. Deploy the runtime
-filesystem with:
+Package archives and APT metadata are stored in a shared cache. Set
+`DEBIAN_NIX_CACHE` to choose its location; otherwise
+`$XDG_CACHE_HOME/debian.nix` or `$HOME/.cache/debian.nix` is used. This cache
+is shared across SDKs and prevents package downloads from being repeated.
+
+Deploy the runtime filesystem with:
 
 ```sh
 mkdir deploy-root
