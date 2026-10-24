@@ -12,37 +12,88 @@ APT repositories.
 
 ## Build A Toolchain
 
-`mkCrossToolchain` is the main public command:
+`mk-sdk` is the main public command:
 
 ```sh
-nix run .#mkCrossToolchain -- TOOLCHAIN_DIR TARGET_SYSTEM SUITE PACKAGE...
+nix run .#mk-sdk -- TOOLCHAIN_DIR TARGET_SYSTEM SUITE \
+  [--packages FILE] PACKAGE...
 ```
 
-For example, create an AArch64 development toolchain from Ubuntu Noble:
+Create an AArch64 SDK from Ubuntu Noble:
 
 ```sh
-nix run .#mkCrossToolchain -- ./toolchain aarch64-linux noble \
-  build-essential cmake zlib1g-dev
+nix run .#mk-sdk -- ./sdk aarch64-linux noble \
+  --packages sdk-packages.txt
 ```
+
+The package file is optional. Packages can be supplied directly when a
+separate file is unnecessary:
+
+```sh
+nix run .#mk-sdk -- ./sdk aarch64-linux noble zlib1g zlib1g-dev
+```
+
+Unprefixed command-line packages are included in both the sysroot and the
+runtime rootfs. Runtime and development categories can also be explicit:
+
+```sh
+nix run .#mk-sdk -- ./sdk aarch64-linux noble \
+  runtime:zlib1g development:zlib1g-dev
+```
+
+The package file uses one package per line and separates deployment packages
+from development packages:
+
+```text
+# Packages included in rootfs.tar.gz and sysroot/
+runtime: zlib1g
+runtime: libusb-1.0-0
+
+# Packages included only in sysroot/
+development: build-essential
+development: cmake
+development: zlib1g-dev
+development: libusb-1.0-0-dev
+```
+
+Blank lines and lines beginning with `#` are ignored.
 
 The command creates:
 
 - `environment`: compiler and sysroot environment variables
 - `<target-triplet>.cmake`: CMake toolchain file
-- `<target>-root`: target sysroot
+- `sysroot/`: target development sysroot
+- `rootfs.tar.gz`: runtime-only root filesystem ready for deployment
 - `<target>-repo`: persistent target package repository
 - `host-root`: host compiler and binutils environment
+
+The bundle is written next to the SDK directory. For example, building
+`./sdk` produces `./sdk.tar.gz`. Share that archive with another compatible
+Linux machine and extract it to reuse the SDK without Nix or package
+resolution:
+
+```sh
+tar -xzf sdk.tar.gz
+cd sdk
+. ./environment
+```
 
 Use the generated environment for application builds:
 
 ```sh
-. ./toolchain/environment
-cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=./toolchain/aarch64-linux-gnu.cmake
+. ./sdk/environment
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=./sdk/aarch64-linux-gnu.cmake
 cmake --build build
 ```
 
 Package archives and APT metadata remain in the repository directories, so
-subsequent invocations reuse already downloaded packages.
+subsequent invocations reuse already downloaded packages. Deploy the runtime
+filesystem with:
+
+```sh
+mkdir deploy-root
+tar -xzf ./sdk/rootfs.tar.gz -C deploy-root
+```
 
 ## Self-Test
 

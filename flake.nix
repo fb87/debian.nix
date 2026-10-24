@@ -44,6 +44,7 @@
           pkgs.gnupg
           pkgs.gnugrep
           pkgs.gnused
+          pkgs.gnutar
           pkgs.gzip
         ];
 
@@ -132,13 +133,13 @@
         mkDevRoot = mkRoot "mk-devroot" nativeRepo "mk-repo";
         mkArm64DevRoot = mkRoot "mk-arm64-devroot" arm64Repo "mk-arm64-repo";
         mkAmd64DevRoot = mkRoot "mk-amd64-devroot" amd64Repo "mk-amd64-repo";
-        mkCrossToolchain = pkgs.writeShellScriptBin "mk-cross-toolchain" ''
+        mkSdk = pkgs.writeShellScriptBin "mk-sdk" ''
           set -euo pipefail
 
            if [ "$#" -lt 4 ]; then
-             printf 'usage: %s TOOLCHAIN_DIR TARGET_SYSTEM SUITE PACKAGE...\n' "$0" >&2
-            exit 2
-          fi
+             printf 'usage: %s TOOLCHAIN_DIR TARGET_SYSTEM SUITE [--packages FILE] PACKAGE...\n' "$0" >&2
+             exit 2
+           fi
 
           toolchain_dir=$1
           if [ ! -d "$toolchain_dir" ]; then
@@ -150,6 +151,79 @@
            shift
            suite=$1
            shift
+           runtime_packages=()
+           development_packages=()
+
+           add_file_package() {
+             line=$1
+             line="''${line#"''${line%%[![:space:]]*}"}"
+             line="''${line%"''${line##*[![:space:]]}"}"
+             [ -z "$line" ] && return
+             [[ "$line" == \#* ]] && return
+             case "$line" in
+               runtime:*)
+                 package="''${line#runtime:}"
+                 ;;
+               development:*)
+                 package="''${line#development:}"
+                 ;;
+               *)
+                 printf 'invalid package entry: %s\n' "$line" >&2
+                 exit 2
+                 ;;
+             esac
+             package="''${package#"''${package%%[![:space:]]*}"}"
+             package="''${package%"''${package##*[![:space:]]}"}"
+             [ -z "$package" ] && return
+             case "$line" in
+               runtime:*) runtime_packages+=("$package") ;;
+               development:*) development_packages+=("$package") ;;
+             esac
+           }
+
+           add_command_package() {
+             package=$1
+             case "$package" in
+               runtime:*) runtime_packages+=("''${package#runtime:}") ;;
+               development:*) development_packages+=("''${package#development:}") ;;
+               *)
+                 runtime_packages+=("$package")
+                 development_packages+=("$package")
+                 ;;
+             esac
+           }
+
+           while [ "$#" -gt 0 ]; do
+             case "$1" in
+               --packages)
+                 [ "$#" -ge 2 ] || { printf '%s requires a file\n' "$1" >&2; exit 2; }
+                 packages_file=$2
+                 [ -f "$packages_file" ] || {
+                   printf 'package file not found: %s\n' "$packages_file" >&2
+                   exit 1
+                 }
+                 while IFS= read -r line || [ -n "$line" ]; do
+                   add_file_package "$line"
+                 done < "$packages_file"
+                 shift 2
+                 ;;
+               --)
+                 shift
+                 while [ "$#" -gt 0 ]; do
+                   add_command_package "$1"
+                   shift
+                 done
+                 ;;
+               *)
+                 add_command_package "$1"
+                 shift
+                 ;;
+             esac
+           done
+           if [ "''${#runtime_packages[@]}" -eq 0 ]; then
+             printf 'at least one package is required\n' >&2
+             exit 2
+           fi
 
           host_repo="$toolchain_dir/host-repo"
           host_root="$toolchain_dir/host-root"
@@ -176,8 +250,10 @@
               target_triple=aarch64-linux-gnu
               target_processor=aarch64
               target_loader=ld-linux-aarch64.so.1
-              target_repo="$toolchain_dir/arm64-repo"
-              target_root="$toolchain_dir/arm64-root"
+               target_repo="$toolchain_dir/arm64-repo"
+               target_rootfs_repo="$toolchain_dir/arm64-rootfs-repo"
+               target_root="$toolchain_dir/sysroot"
+               target_rootfs="$toolchain_dir/rootfs"
               target_builder=${mkArm64DevRoot}/bin/mk-arm64-devroot
               ;;
             x86_64-linux)
@@ -185,8 +261,10 @@
               target_triple=x86_64-linux-gnu
               target_processor=x86_64
               target_loader=ld-linux-x86-64.so.2
-              target_repo="$toolchain_dir/amd64-repo"
-              target_root="$toolchain_dir/amd64-root"
+               target_repo="$toolchain_dir/amd64-repo"
+               target_rootfs_repo="$toolchain_dir/amd64-rootfs-repo"
+               target_root="$toolchain_dir/sysroot"
+               target_rootfs="$toolchain_dir/rootfs"
               target_builder=${mkAmd64DevRoot}/bin/mk-amd64-devroot
               ;;
             *)
@@ -216,19 +294,7 @@
               "$suite" \
               "''${host_packages[@]}"
 
-           for linker_script in "$host_root/usr/$target_triple/lib/"*.so; do
-             if [ -f "$linker_script" ] &&
-                ${pkgs.gnugrep}/bin/grep -q '^GROUP (' "$linker_script"; then
-               ${pkgs.gnused}/bin/sed -i \
-                 -e "s# /usr/$target_triple/# $host_root/usr/$target_triple/#g" \
-                 -e "s# /lib64/# $host_root/lib64/#g" \
-                 "$linker_script"
-             fi
-           done
-
            ${pkgs.coreutils}/bin/mkdir -p "$wrapper_dir"
-           host_loader_path="$host_root/usr/lib/$host_triple/$host_loader"
-           host_library_path="$host_root/usr/lib/$host_triple:$host_root/usr/lib"
            ${pkgs.coreutils}/bin/mkdir -p "$host_root/lib"
            if [ ! -e "$host_root/lib/$host_triple" ] &&
               [ ! -L "$host_root/lib/$host_triple" ]; then
@@ -257,45 +323,54 @@
              if [ -f "$linker_script" ] &&
                 ${pkgs.gnugrep}/bin/grep -q '^GROUP (' "$linker_script"; then
                ${pkgs.gnused}/bin/sed -i \
-                 -e "s# /lib/# $host_root/lib/#g" \
-                 -e "s# /usr/lib/# $host_root/usr/lib/#g" \
-                 -e "s# /usr/$host_triple/# $host_root/usr/$host_triple/#g" \
-                 -e "s# /lib64/# $host_root/lib64/#g" \
+                 -e 's# /lib/# =/lib/#g' \
+                 -e 's# /usr/lib/# =/usr/lib/#g' \
+                 -e 's# /usr/$host_triple/# =/usr/$host_triple/#g' \
+                 -e 's# /lib64/# =/lib64/#g' \
                  "$linker_script"
              fi
            done
 
            ${pkgs.coreutils}/bin/cat > "$wrapper_dir/tool-wrapper" <<EOF
-          #!/bin/sh
-          set -eu
-          case "\$1" in
-            "$wrapper_dir/"*)
-              exec "\$@"
-              ;;
-          esac
-           exec "$host_loader_path" --library-path "$host_library_path" "\$@"
+           #!/bin/sh
+           set -eu
+             sdk_root=\$(CDPATH= cd -- "\''${0%/*}/.." && pwd)
+           host_loader="\$sdk_root/host-root/usr/lib/$host_triple/$host_loader"
+           host_library_path="\$sdk_root/host-root/usr/lib/$host_triple:\$sdk_root/host-root/usr/lib"
+           case "\$1" in
+             "\$sdk_root/bin/"*)
+               exec "\$@"
+               ;;
+            esac
+             exec "\$host_loader" --library-path "\$host_library_path" "\$@"
           EOF
 
           ${pkgs.coreutils}/bin/cat > "$wrapper_dir/gcc" <<EOF
-          #!/bin/sh
-          set -eu
-          exec "$host_loader_path" --library-path "$host_library_path" \\
-            "$host_root/usr/bin/$compiler_name" \\
-            -wrapper "$wrapper_dir/tool-wrapper" "\$@"
+           #!/bin/sh
+           set -eu
+             sdk_root=\$(CDPATH= cd -- "\''${0%/*}/.." && pwd)
+           host_loader="\$sdk_root/host-root/usr/lib/$host_triple/$host_loader"
+           exec "\$host_loader" --library-path "\$sdk_root/host-root/usr/lib/$host_triple:\$sdk_root/host-root/usr/lib" \\
+             "\$sdk_root/host-root/usr/bin/$compiler_name" \\
+               -wrapper "\$sdk_root/bin/tool-wrapper" "\$@"
           EOF
 
           ${pkgs.coreutils}/bin/cat > "$wrapper_dir/g++" <<EOF
-          #!/bin/sh
-          set -eu
-          exec "$host_loader_path" --library-path "$host_library_path" \\
-            "$host_root/usr/bin/$cxx_compiler_name" \\
-            -wrapper "$wrapper_dir/tool-wrapper" "\$@"
+           #!/bin/sh
+           set -eu
+             sdk_root=\$(CDPATH= cd -- "\''${0%/*}/.." && pwd)
+           host_loader="\$sdk_root/host-root/usr/lib/$host_triple/$host_loader"
+           exec "\$host_loader" --library-path "\$sdk_root/host-root/usr/lib/$host_triple:\$sdk_root/host-root/usr/lib" \\
+             "\$sdk_root/host-root/usr/bin/$cxx_compiler_name" \\
+               -wrapper "\$sdk_root/bin/tool-wrapper" "\$@"
           EOF
 
           ${pkgs.coreutils}/bin/cat > "$wrapper_dir/binutils-wrapper" <<EOF
-          #!/bin/sh
-          set -eu
-          name=\$(basename "\$0")
+           #!/bin/sh
+           set -eu
+             sdk_root=\$(CDPATH= cd -- "\''${0%/*}/.." && pwd)
+           host_loader="\$sdk_root/host-root/usr/lib/$host_triple/$host_loader"
+           name=\$(basename "\$0")
           case "\$name" in
             "$target_triple-as") name=as ;;
             "$target_triple-ld") name=ld ;;
@@ -308,8 +383,8 @@
             "$target_triple-readelf") name=readelf ;;
           esac
           [ "\$name" = ld ] && name=ld.bfd
-          exec "$host_loader_path" --library-path "$host_library_path" \\
-            "$host_root/usr/bin/$host_tool_prefix\$name" "\$@"
+           exec "\$host_loader" --library-path "\$sdk_root/host-root/usr/lib/$host_triple:\$sdk_root/host-root/usr/lib" \\
+             "\$sdk_root/host-root/usr/bin/$host_tool_prefix\$name" "\$@"
           EOF
 
           for tool in as ld ar ranlib strip objcopy nm objdump readelf; do
@@ -323,7 +398,47 @@
             "$wrapper_dir/tool-wrapper" "$wrapper_dir/binutils-wrapper"
            c_compiler="$wrapper_dir/gcc"
            cxx_compiler="$wrapper_dir/g++"
-           "$target_builder" "$target_root" "$target_repo" "$suite" "$@"
+           target_packages=("''${runtime_packages[@]}" "''${development_packages[@]}")
+           "$target_builder" "$target_root" "$target_repo" "$suite" \
+             "''${target_packages[@]}"
+           ${pkgs.coreutils}/bin/rm -rf "$target_rootfs"
+           "$target_builder" "$target_rootfs" "$target_rootfs_repo" "$suite" \
+             "''${runtime_packages[@]}"
+
+           prepare_root() {
+             root=$1
+             ${pkgs.coreutils}/bin/mkdir -p "$root/lib" "$root/usr/$target_triple"
+             if [ ! -e "$root/lib/$target_triple" ] &&
+                [ ! -L "$root/lib/$target_triple" ]; then
+               ${pkgs.coreutils}/bin/ln -s ../usr/lib/$target_triple \
+                 "$root/lib/$target_triple"
+             fi
+             if [ ! -e "$root/usr/$target_triple/lib" ] &&
+                [ ! -L "$root/usr/$target_triple/lib" ]; then
+               ${pkgs.coreutils}/bin/ln -s ../../lib/$target_triple \
+                 "$root/usr/$target_triple/lib"
+             fi
+             if [ ! -e "$root/lib/$target_loader" ] &&
+                [ ! -L "$root/lib/$target_loader" ]; then
+               ${pkgs.coreutils}/bin/ln -s \
+                 ../usr/lib/$target_triple/$target_loader \
+                 "$root/lib/$target_loader"
+             fi
+             if [ "$target_debian" = amd64 ]; then
+               ${pkgs.coreutils}/bin/mkdir -p "$root/lib64"
+               if [ ! -e "$root/lib64/$target_loader" ] &&
+                  [ ! -L "$root/lib64/$target_loader" ]; then
+                 ${pkgs.coreutils}/bin/ln -s \
+                   ../usr/lib/$target_triple/$target_loader \
+                   "$root/lib64/$target_loader"
+               fi
+             fi
+           }
+           prepare_root "$target_root"
+           prepare_root "$target_rootfs"
+           ${pkgs.gnutar}/bin/tar -C "$target_rootfs" \
+             -czf "$toolchain_dir/rootfs.tar.gz" .
+           ${pkgs.coreutils}/bin/rm -rf "$target_rootfs"
 
            target_arch=x86
            [ "$target_debian" = arm64 ] && target_arch=arm64
@@ -349,29 +464,32 @@
              fi
            fi
            ${pkgs.coreutils}/bin/cat > "$toolchain_dir/environment" <<EOF
-          export TOOLCHAIN_ROOT="$toolchain_dir"
-          export SYSROOT="$target_root"
-          export ARCH="$target_arch"
-          export CROSS_COMPILE="$cross_compile_prefix"
-          export CC="$c_compiler"
-          export CXX="$cxx_compiler"
-          export CPP="$c_compiler -E"
-          export AR="$wrapper_dir/ar"
-          export AS="$wrapper_dir/as"
-          export LD="$wrapper_dir/ld"
-          export NM="$wrapper_dir/nm"
-          export OBJCOPY="$wrapper_dir/objcopy"
-          export OBJDUMP="$wrapper_dir/objdump"
-          export RANLIB="$wrapper_dir/ranlib"
-          export READELF="$wrapper_dir/readelf"
-          export STRIP="$wrapper_dir/strip"
-          export PKG_CONFIG_SYSROOT_DIR="$target_root"
-          export PKG_CONFIG_LIBDIR="$target_root/usr/lib/$target_triple/pkgconfig:$target_root/usr/share/pkgconfig"
-          export PKG_CONFIG_PATH=
-          export PATH="$wrapper_dir:\$PATH"
-           export CFLAGS="-B$wrapper_dir --sysroot=$target_root"
-           export CXXFLAGS="-B$wrapper_dir --sysroot=$target_root"
-          export LDFLAGS="-B$wrapper_dir -L$target_root/usr/$target_triple/lib -L$target_root/usr/lib/$target_triple -Wl,-rpath-link,$target_root/usr/lib/$target_triple"
+            SDK_ROOT=\$(CDPATH= cd -- "\''${BASH_SOURCE[0]%/*}" && pwd)
+           export TOOLCHAIN_ROOT="\$SDK_ROOT"
+           export SYSROOT="\$SDK_ROOT/sysroot"
+           export ARCH="$target_arch"
+           export CROSS_COMPILE=""
+           [ -n "$cross_compile_prefix" ] && \
+             export CROSS_COMPILE="\$SDK_ROOT/bin/$target_triple-"
+           export CC="\$SDK_ROOT/bin/gcc"
+           export CXX="\$SDK_ROOT/bin/g++"
+           export CPP="\$SDK_ROOT/bin/gcc -E"
+           export AR="\$SDK_ROOT/bin/ar"
+           export AS="\$SDK_ROOT/bin/as"
+           export LD="\$SDK_ROOT/bin/ld"
+           export NM="\$SDK_ROOT/bin/nm"
+           export OBJCOPY="\$SDK_ROOT/bin/objcopy"
+           export OBJDUMP="\$SDK_ROOT/bin/objdump"
+           export RANLIB="\$SDK_ROOT/bin/ranlib"
+           export READELF="\$SDK_ROOT/bin/readelf"
+           export STRIP="\$SDK_ROOT/bin/strip"
+           export PKG_CONFIG_SYSROOT_DIR="\$SDK_ROOT/sysroot"
+           export PKG_CONFIG_LIBDIR="\$SDK_ROOT/sysroot/usr/lib/$target_triple/pkgconfig:\$SDK_ROOT/sysroot/usr/share/pkgconfig"
+           export PKG_CONFIG_PATH=
+           export PATH="\$SDK_ROOT/bin:\$PATH"
+           export CFLAGS="-B\$SDK_ROOT/bin --sysroot=\$SDK_ROOT/sysroot"
+           export CXXFLAGS="-B\$SDK_ROOT/bin --sysroot=\$SDK_ROOT/sysroot"
+           export LDFLAGS="-B\$SDK_ROOT/bin -L\$SDK_ROOT/sysroot/usr/$target_triple/lib -L\$SDK_ROOT/sysroot/usr/lib/$target_triple -Wl,-rpath-link,\$SDK_ROOT/sysroot/usr/lib/$target_triple"
           EOF
 
           ${pkgs.coreutils}/bin/mkdir -p \
@@ -402,33 +520,45 @@
             fi
           fi
 
-          ${pkgs.coreutils}/bin/cat > "$toolchain_file" <<EOF
-          set(CMAKE_SYSTEM_NAME Linux)
-          set(CMAKE_SYSTEM_PROCESSOR $target_processor)
-          set(CMAKE_LIBRARY_ARCHITECTURE $target_triple)
+           ${pkgs.coreutils}/bin/cat > "$toolchain_file" <<EOF
+            set(SDK_ROOT "\''${CMAKE_CURRENT_LIST_DIR}")
+            set(TARGET_ROOT "\''${SDK_ROOT}/sysroot")
+            set(WRAPPER_DIR "\''${SDK_ROOT}/bin")
+           set(CMAKE_SYSTEM_NAME Linux)
+           set(CMAKE_SYSTEM_PROCESSOR $target_processor)
+           set(CMAKE_LIBRARY_ARCHITECTURE $target_triple)
 
-           set(CMAKE_C_COMPILER "$c_compiler")
-           set(CMAKE_CXX_COMPILER "$cxx_compiler")
-           set(CMAKE_C_FLAGS_INIT
-               "-B$wrapper_dir --sysroot=$target_root -L$target_root/usr/$target_triple/lib -L$target_root/usr/lib/$target_triple -Wl,-rpath-link,$target_root/usr/lib/$target_triple")
-           set(CMAKE_CXX_FLAGS_INIT
-               "-B$wrapper_dir --sysroot=$target_root -L$target_root/usr/$target_triple/lib -L$target_root/usr/lib/$target_triple -Wl,-rpath-link,$target_root/usr/lib/$target_triple")
-           set(CMAKE_EXE_LINKER_FLAGS_INIT
-               "-B$wrapper_dir --sysroot=$target_root -L$target_root/usr/$target_triple/lib -L$target_root/usr/lib/$target_triple -Wl,-rpath-link,$target_root/usr/lib/$target_triple")
-           set(CMAKE_FIND_ROOT_PATH "$target_root")
+            set(CMAKE_C_COMPILER "\''${WRAPPER_DIR}/gcc")
+            set(CMAKE_CXX_COMPILER "\''${WRAPPER_DIR}/g++")
+            set(CMAKE_C_FLAGS_INIT
+                "-B\''${WRAPPER_DIR} -L\''${TARGET_ROOT}/usr/$target_triple/lib -L\''${TARGET_ROOT}/usr/lib/$target_triple -Wl,-rpath-link,\''${TARGET_ROOT}/usr/lib/$target_triple")
+            set(CMAKE_CXX_FLAGS_INIT
+                "-B\''${WRAPPER_DIR} -L\''${TARGET_ROOT}/usr/$target_triple/lib -L\''${TARGET_ROOT}/usr/lib/$target_triple -Wl,-rpath-link,\''${TARGET_ROOT}/usr/lib/$target_triple")
+            set(CMAKE_EXE_LINKER_FLAGS_INIT
+                "-B\''${WRAPPER_DIR} -L\''${TARGET_ROOT}/usr/$target_triple/lib -L\''${TARGET_ROOT}/usr/lib/$target_triple -Wl,-rpath-link,\''${TARGET_ROOT}/usr/lib/$target_triple")
+           set(CMAKE_SYSROOT "\''${TARGET_ROOT}")
+            set(CMAKE_FIND_ROOT_PATH "\''${TARGET_ROOT}")
           set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
           set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
           set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
           set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 
-          set(ENV{PKG_CONFIG_SYSROOT_DIR} "$target_root")
-          set(ENV{PKG_CONFIG_LIBDIR}
-              "$target_root/usr/lib/$target_triple/pkgconfig:$target_root/usr/share/pkgconfig")
-           set(ENV{PKG_CONFIG_PATH} "")
+           set(ENV{PKG_CONFIG_SYSROOT_DIR} "\''${TARGET_ROOT}")
+           set(ENV{PKG_CONFIG_LIBDIR}
+                "\''${TARGET_ROOT}/usr/lib/$target_triple/pkgconfig:\''${TARGET_ROOT}/usr/share/pkgconfig")
+             set(ENV{PKG_CONFIG_PATH} "")
           EOF
-         '';
 
-         selfTest = pkgs.writeShellScriptBin "self-test" ''
+           sdk_archive="$toolchain_dir.tar.gz"
+           ${pkgs.coreutils}/bin/rm -f "$sdk_archive"
+           ${pkgs.gnutar}/bin/tar \
+             -C "$(${pkgs.coreutils}/bin/dirname "$toolchain_dir")" \
+             -czf "$sdk_archive" \
+             "$(${pkgs.coreutils}/bin/basename "$toolchain_dir")"
+           printf 'SDK bundle: %s\n' "$sdk_archive"
+          '';
+
+        selfTest = pkgs.writeShellScriptBin "self-test" ''
            set -euo pipefail
 
            if [ "$#" -lt 3 ]; then
@@ -442,10 +572,24 @@
            work=$(${pkgs.coreutils}/bin/mktemp -d)
            trap '${pkgs.coreutils}/bin/rm -rf "$work"' EXIT
 
-           ${mkCrossToolchain}/bin/mk-cross-toolchain \
-             "$toolchain_dir" "$target_system" "$suite" zlib1g-dev
+            ${pkgs.coreutils}/bin/printf '%s\n' \
+              'runtime: zlib1g' 'development: zlib1g-dev' > "$work/sdk-packages.txt"
+            ${mkSdk}/bin/mk-sdk \
+              "$toolchain_dir" "$target_system" "$suite" \
+              --packages "$work/sdk-packages.txt"
+            test -s "$toolchain_dir/rootfs.tar.gz"
+            ${pkgs.gnutar}/bin/tar -tzf "$toolchain_dir/rootfs.tar.gz" |
+              ${pkgs.gnugrep}/bin/grep '^\./usr/' >/dev/null
+            sdk_archive="$toolchain_dir.tar.gz"
+            test -s "$sdk_archive"
+            ${pkgs.gnutar}/bin/tar -tzf "$sdk_archive" |
+              ${pkgs.gnugrep}/bin/grep '/environment$' >/dev/null
+            ${pkgs.gnutar}/bin/tar -tzf "$sdk_archive" |
+              ${pkgs.gnugrep}/bin/grep '/sysroot/' >/dev/null
+            ${pkgs.gnutar}/bin/tar -tzf "$sdk_archive" |
+              ${pkgs.gnugrep}/bin/grep '/rootfs.tar.gz$' >/dev/null
 
-           # Compile a target binary through the generated environment.
+            # Compile a target binary through the generated environment.
            . "$toolchain_dir/environment"
            ${pkgs.coreutils}/bin/printf '%s\n' \
              'int main(void) { return 0; }' > "$work/hello.c"
@@ -466,7 +610,8 @@
            esac
          '';
       in {
-        inherit mkCrossToolchain selfTest;
+         "mk-sdk" = mkSdk;
+         inherit selfTest;
       };
     });
 }
